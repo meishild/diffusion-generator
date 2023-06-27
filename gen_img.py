@@ -39,12 +39,8 @@ from pipline_diffusers import (
     PipelineLike,
 )
 
-
 from transformers import  CLIPTokenizer, CLIPModel
 from PIL import Image
-
-import library.model_util as model_util
-
 
 class BatchDataBase(NamedTuple):
     # 基础数据
@@ -189,6 +185,9 @@ def resize_images(imgs, size):
         resized.append(r_img)
     return resized
 
+def is_safetensors(path):
+    return os.path.splitext(path)[1].lower() == ".safetensors"
+
 class GenImages():
     def __init__(self):
         # load Stable Diffusion v2.0 model
@@ -277,7 +276,12 @@ class GenImages():
         use_stable_diffusion_format = os.path.isfile(self._ckpt)
         if use_stable_diffusion_format:
             print("load StableDiffusion checkpoint")
-            self._text_encoder, self._vae, self._unet = model_util.load_models_from_stable_diffusion_checkpoint(self.v2, self._ckpt)
+            loading_pipe = StableDiffusionPipeline.from_ckpt(self._ckpt, safety_checker=None, torch_dtype=self._dtype)
+            self._text_encoder = loading_pipe.text_encoder
+            self._vae = loading_pipe.vae
+            self._unet = loading_pipe.unet
+            self._tokenizer = loading_pipe.tokenizer
+            del loading_pipe
         else:
             print("load Diffusers pretrained models")
             loading_pipe = StableDiffusionPipeline.from_pretrained(self._ckpt, safety_checker=None, torch_dtype=self._dtype)
@@ -485,7 +489,7 @@ class GenImages():
 
             print("load network weights from:", n.network_weight)
 
-            if model_util.is_safetensors(n.network_weight) and n.network_show_meta:
+            if is_safetensors(n.network_weight) and n.network_show_meta:
                 from safetensors.torch import safe_open
 
                 with safe_open(n.network_weight, framework="pt") as f:
@@ -542,7 +546,7 @@ class GenImages():
         
         token_ids_embeds = []
         for embeds_file in self.textual_inversion_embeddings:
-            if model_util.is_safetensors(embeds_file):
+            if is_safetensors(embeds_file):
                 from safetensors.torch import load_file
                 data = load_file(embeds_file)
             else:
@@ -664,7 +668,7 @@ class GenImages():
         batch_size = len(batch)
         max_embeddings_multiples = 1 if self.max_embeddings_multiples is None else self.max_embeddings_multiples
 
-        # このバッチの情報を取り出す
+        # 处理批次的信息
         (
             return_latents,
             (_, _, _, _, clip_skip, init_image, mask_image, _, guide_image),
@@ -742,7 +746,7 @@ class GenImages():
 
         self._noise_manager.reset_sampler_noises(noises)
 
-        # すべての画像が同じなら1枚だけpipeに渡すことでpipe側で処理を高速化する
+        # 如果所有的图像都一样，就只给pipe一张，在pipe侧加速处理。
         if init_images is not None and all_images_are_same:
             init_images = init_images[0]
         if mask_images is not None and all_masks_are_same:
@@ -795,9 +799,11 @@ class GenImages():
 
     def load_vae(self, vae):
          # 单独加载vae
-        if vae is not None:
-            self._vae = model_util.load_vae(vae, self._dtype)
-            print("additional VAE loaded")
+        # if vae is not None:
+        #     self._vae = model_util.load_vae(vae, self._dtype)
+        #     print("additional VAE loaded")
+        print("error VAE loaded")
+        
 
     def txt2img(self, param: Txt2ImgParams):
         if self.v_parameterization and not self.v2:

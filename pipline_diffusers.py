@@ -25,8 +25,8 @@ import PIL
 from PIL import Image
 
 from networks.lora import LoRANetwork
-import tools.original_control_net as original_control_net
-from tools.original_control_net import ControlNetInfo
+# import tools.original_control_net as original_control_net
+# from tools.original_control_net import ControlNetInfo
 
 # Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
@@ -242,10 +242,11 @@ class FlashAttentionFunction(torch.autograd.Function):
 
 
 def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditionModel, mem_eff_attn, xformers):
-    if mem_eff_attn:
-        replace_unet_cross_attn_to_memory_efficient()
-    elif xformers:
-        replace_unet_cross_attn_to_xformers()
+    # if mem_eff_attn:
+    #     replace_unet_cross_attn_to_memory_efficient()
+    # elif xformers:
+    #     replace_unet_cross_attn_to_xformers()
+    pass
 
 
 def replace_unet_cross_attn_to_memory_efficient():
@@ -404,7 +405,7 @@ class PipelineLike:
             self.vgg16_normalize = transforms.Normalize(mean=VGG16_IMAGE_MEAN, std=VGG16_IMAGE_STD)
 
         # ControlNet
-        self.control_nets: List[ControlNetInfo] = []
+        # self.control_nets: List[ControlNetInfo] = []
 
     def set_scheduler(self, scheduler):
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
@@ -459,8 +460,8 @@ class PipelineLike:
     def add_token_replacement_XTI(self, target_token_id, rep_token_ids):
         self.token_replacements_XTI[target_token_id] = rep_token_ids
 
-    def set_control_nets(self, ctrl_nets):
-        self.control_nets = ctrl_nets
+    # def set_control_nets(self, ctrl_nets):
+    #     self.control_nets = ctrl_nets
 
     # region xformersとか使う部分：独自に書き換えるので関係なし
 
@@ -773,7 +774,7 @@ class PipelineLike:
             self.clip_image_guidance_scale > 0
             or self.vgg16_guidance_scale > 0
             and clip_guide_images is not None
-            or self.control_nets
+            # or self.control_nets
         ):
             if isinstance(clip_guide_images, PIL.Image.Image):
                 clip_guide_images = [clip_guide_images]
@@ -923,8 +924,8 @@ class PipelineLike:
 
         num_latent_input = (3 if negative_scale is not None else 2) if do_classifier_free_guidance else 1
 
-        if self.control_nets:
-            guided_hints = original_control_net.get_guided_hints(self.control_nets, num_latent_input, batch_size, clip_guide_images)
+        # if self.control_nets:
+            # guided_hints = original_control_net.get_guided_hints(self.control_nets, num_latent_input, batch_size, clip_guide_images)
 
         for i, t in enumerate(tqdm(timesteps)):
             # expand the latents if we are doing classifier free guidance
@@ -932,25 +933,25 @@ class PipelineLike:
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # predict the noise residual
-            if self.control_nets:
-                if reginonal_network:
-                    num_sub_and_neg_prompts = len(text_embeddings) // batch_size
-                    text_emb_last = text_embeddings[num_sub_and_neg_prompts - 2 :: num_sub_and_neg_prompts]  # last subprompt
-                else:
-                    text_emb_last = text_embeddings
-                noise_pred = original_control_net.call_unet_and_control_net(
-                    i,
-                    num_latent_input,
-                    self.unet,
-                    self.control_nets,
-                    guided_hints,
-                    i / len(timesteps),
-                    latent_model_input,
-                    t,
-                    text_emb_last,
-                ).sample
-            else:
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            # if self.control_nets:
+            #     if reginonal_network:
+            #         num_sub_and_neg_prompts = len(text_embeddings) // batch_size
+            #         text_emb_last = text_embeddings[num_sub_and_neg_prompts - 2 :: num_sub_and_neg_prompts]  # last subprompt
+            #     else:
+            #         text_emb_last = text_embeddings
+            #     noise_pred = original_control_net.call_unet_and_control_net(
+            #         i,
+            #         num_latent_input,
+            #         self.unet,
+            #         self.control_nets,
+            #         guided_hints,
+            #         i / len(timesteps),
+            #         latent_model_input,
+            #         t,
+            #         text_emb_last,
+            #     ).sample
+            # else:
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
             # perform guidance
             if do_classifier_free_guidance:
