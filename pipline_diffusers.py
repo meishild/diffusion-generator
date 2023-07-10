@@ -8,7 +8,6 @@ import re
 import diffusers
 import numpy as np
 import torch
-import torchvision
 from diffusers import (
     AutoencoderKL,
     LMSDiscreteScheduler,
@@ -25,12 +24,6 @@ import PIL
 from PIL import Image
 
 from networks.lora import LoRANetwork
-# import tools.original_control_net as original_control_net
-# from tools.original_control_net import ControlNetInfo
-
-# Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
-TOKENIZER_PATH = "openai/clip-vit-large-patch14"
-V2_STABLE_DIFFUSION_PATH = "stabilityai/stable-diffusion-2"  # ここからtokenizerだけ使う
 
 DEFAULT_TOKEN_LENGTH = 75
 
@@ -44,26 +37,15 @@ SCHEDLER_SCHEDULE = "scaled_linear"
 LATENT_CHANNELS = 4
 DOWNSAMPLING_FACTOR = 8
 
-# CLIP_ID_L14_336 = "openai/clip-vit-large-patch14-336"
-
 # CLIP guided SD関連
 CLIP_MODEL_PATH = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 FEATURE_EXTRACTOR_SIZE = (224, 224)
 FEATURE_EXTRACTOR_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
 FEATURE_EXTRACTOR_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
 
-VGG16_IMAGE_MEAN = [0.485, 0.456, 0.406]
-VGG16_IMAGE_STD = [0.229, 0.224, 0.225]
-VGG16_INPUT_RESIZE_DIV = 4
-
 # CLIP特徴量の取得時にcutoutを使うか：使う場合にはソースを書き換えてください
 NUM_CUTOUTS = 4
 USE_CUTOUTS = False
-
-# region モジュール入れ替え部
-"""
-高速化のためのモジュール入れ替え
-"""
 
 # FlashAttentionを使うCrossAttention
 # based on https://github.com/lucidrains/memory-efficient-attention-pytorch/blob/main/memory_efficient_attention_pytorch/flash_attention.py
@@ -241,14 +223,6 @@ class FlashAttentionFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None
 
 
-def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditionModel, mem_eff_attn, xformers):
-    # if mem_eff_attn:
-    #     replace_unet_cross_attn_to_memory_efficient()
-    # elif xformers:
-    #     replace_unet_cross_attn_to_xformers()
-    pass
-
-
 def replace_unet_cross_attn_to_memory_efficient():
     print("Replace CrossAttention.forward to use NAI style Hypernetwork and FlashAttention")
     flash_func = FlashAttentionFunction
@@ -368,11 +342,6 @@ class PipelineLike:
         clip_model: CLIPModel,
         clip_guidance_scale: float,
         clip_image_guidance_scale: float,
-        vgg16_model: torchvision.models.VGG,
-        vgg16_guidance_scale: float,
-        vgg16_layer_no: int,
-        # safety_checker: StableDiffusionSafetyChecker,
-        # feature_extractor: CLIPFeatureExtractor,
     ):
         super().__init__()
         self.device = device
@@ -394,18 +363,6 @@ class PipelineLike:
         self.clip_model = clip_model
         self.normalize = transforms.Normalize(mean=FEATURE_EXTRACTOR_IMAGE_MEAN, std=FEATURE_EXTRACTOR_IMAGE_STD)
         self.make_cutouts = MakeCutouts(FEATURE_EXTRACTOR_SIZE)
-
-        # VGG16 guidance
-        self.vgg16_guidance_scale = vgg16_guidance_scale
-        if self.vgg16_guidance_scale > 0.0:
-            return_layers = {f"{vgg16_layer_no}": "feat"}
-            self.vgg16_feat_model = torchvision.models._utils.IntermediateLayerGetter(
-                vgg16_model.features, return_layers=return_layers
-            )
-            self.vgg16_normalize = transforms.Normalize(mean=VGG16_IMAGE_MEAN, std=VGG16_IMAGE_STD)
-
-        # ControlNet
-        # self.control_nets: List[ControlNetInfo] = []
 
     def set_scheduler(self, scheduler):
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
@@ -772,7 +729,6 @@ class PipelineLike:
 
         if (
             self.clip_image_guidance_scale > 0
-            or self.vgg16_guidance_scale > 0
             and clip_guide_images is not None
             # or self.control_nets
         ):
@@ -788,18 +744,8 @@ class PipelineLike:
                 image_embeddings_clip = image_embeddings_clip / image_embeddings_clip.norm(p=2, dim=-1, keepdim=True)
                 if len(image_embeddings_clip) == 1:
                     image_embeddings_clip = image_embeddings_clip.repeat((batch_size, 1, 1, 1))
-            elif self.vgg16_guidance_scale > 0:
-                size = (width // VGG16_INPUT_RESIZE_DIV, height // VGG16_INPUT_RESIZE_DIV)  # とりあえず1/4に（小さいか?）
-                clip_guide_images = [preprocess_vgg16_guide_image(im, size) for im in clip_guide_images]
-                clip_guide_images = torch.cat(clip_guide_images, dim=0)
-
-                clip_guide_images = self.vgg16_normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
-                image_embeddings_vgg16 = self.vgg16_feat_model(clip_guide_images)["feat"]
-                if len(image_embeddings_vgg16) == 1:
-                    image_embeddings_vgg16 = image_embeddings_vgg16.repeat((batch_size, 1, 1, 1))
             else:
-                # ControlNetのhintにguide imageを流用する
-                # 前処理はControlNet側で行う
+                # ControlNet
                 pass
 
         # set timesteps
@@ -969,7 +915,7 @@ class PipelineLike:
                     )
 
             # perform clip guidance
-            if self.clip_guidance_scale > 0 or self.clip_image_guidance_scale > 0 or self.vgg16_guidance_scale > 0:
+            if (self.clip_guidance_scale > 0  or self.clip_image_guidance_scale > 0):
                 text_embeddings_for_guidance = (
                     text_embeddings.chunk(num_latent_input)[1] if do_classifier_free_guidance else text_embeddings
                 )
@@ -997,10 +943,6 @@ class PipelineLike:
                         self.clip_image_guidance_scale,
                         NUM_CUTOUTS,
                         USE_CUTOUTS,
-                    )
-                if self.vgg16_guidance_scale > 0 and clip_guide_images is not None:
-                    noise_pred, latents = self.cond_fn_vgg16(
-                        latents, t, i, text_embeddings_for_guidance, noise_pred, image_embeddings_vgg16, self.vgg16_guidance_scale
                     )
 
             # compute the previous noisy sample x_t -> x_t-1
@@ -1049,14 +991,11 @@ class PipelineLike:
             has_nsfw_concept = None
 
         if output_type == "pil":
-            # image = self.numpy_to_pil(image)
             image = (image * 255).round().astype("uint8")
             image = [Image.fromarray(im) for im in image]
 
         # if not return_dict:
         return (image, has_nsfw_concept)
-
-        # return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
     def text2img(
         self,
@@ -1452,78 +1391,7 @@ class PipelineLike:
             noise_pred = noise_pred_original - torch.sqrt(beta_prod_t) * grads
         return noise_pred, latents
 
-    # バッチを分解して一件ずつ処理する
-    def cond_fn_vgg16(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale):
-        if len(latents) == 1:
-            return self.cond_fn_vgg16_b1(
-                latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale
-            )
-
-        noise_pred = []
-        cond_latents = []
-        for i in range(len(latents)):
-            lat1 = latents[i].unsqueeze(0)
-            tem1 = text_embeddings[i].unsqueeze(0)
-            npo1 = noise_pred_original[i].unsqueeze(0)
-            gem1 = guide_embeddings[i].unsqueeze(0)
-            npr1, cla1 = self.cond_fn_vgg16_b1(lat1, timestep, index, tem1, npo1, gem1, guidance_scale)
-            noise_pred.append(npr1)
-            cond_latents.append(cla1)
-
-        noise_pred = torch.cat(noise_pred)
-        cond_latents = torch.cat(cond_latents)
-        return noise_pred, cond_latents
-
-    # 1件だけ処理する
-    @torch.enable_grad()
-    def cond_fn_vgg16_b1(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale):
-        latents = latents.detach().requires_grad_()
-
-        if isinstance(self.scheduler, LMSDiscreteScheduler):
-            sigma = self.scheduler.sigmas[index]
-            # the model input needs to be scaled to match the continuous ODE formulation in K-LMS
-            latent_model_input = latents / ((sigma**2 + 1) ** 0.5)
-        else:
-            latent_model_input = latents
-
-        # predict the noise residual
-        noise_pred = self.unet(latent_model_input, timestep, encoder_hidden_states=text_embeddings).sample
-
-        if isinstance(self.scheduler, (PNDMScheduler, DDIMScheduler)):
-            alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
-            beta_prod_t = 1 - alpha_prod_t
-            # compute predicted original sample from predicted noise also called
-            # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-            pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
-
-            fac = torch.sqrt(beta_prod_t)
-            sample = pred_original_sample * (fac) + latents * (1 - fac)
-        elif isinstance(self.scheduler, LMSDiscreteScheduler):
-            sigma = self.scheduler.sigmas[index]
-            sample = latents - sigma * noise_pred
-        else:
-            raise ValueError(f"scheduler type {type(self.scheduler)} not supported")
-
-        sample = 1 / 0.18215 * sample
-        image = self.vae.decode(sample).sample
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = transforms.Resize((image.shape[-2] // VGG16_INPUT_RESIZE_DIV, image.shape[-1] // VGG16_INPUT_RESIZE_DIV))(image)
-        image = self.vgg16_normalize(image).to(latents.dtype)
-
-        image_embeddings = self.vgg16_feat_model(image)["feat"]
-
-        # バッチサイズが複数だと正しく動くかわからない
-        loss = ((image_embeddings - guide_embeddings) ** 2).mean() * guidance_scale  # MSE style transferでコンテンツの損失はMSEなので
-
-        grads = -torch.autograd.grad(loss, latents)[0]
-        if isinstance(self.scheduler, LMSDiscreteScheduler):
-            latents = latents.detach() + grads * (sigma**2)
-            noise_pred = noise_pred_original
-        else:
-            noise_pred = noise_pred_original - torch.sqrt(beta_prod_t) * grads
-        return noise_pred, latents
-
-
+    
 class MakeCutouts(torch.nn.Module):
     def __init__(self, cut_size, cut_power=1.0):
         super().__init__()
@@ -1930,16 +1798,6 @@ def preprocess_guide_image(image):
     image = image[None].transpose(0, 3, 1, 2)  # nchw
     image = torch.from_numpy(image)
     return image  # 0 to 1
-
-
-# VGG16の入力は任意サイズでよいので入力画像を適宜リサイズする
-def preprocess_vgg16_guide_image(image, size):
-    image = image.resize(size, resample=Image.NEAREST)  # cond_fnと合わせる
-    image = np.array(image).astype(np.float32) / 255.0
-    image = image[None].transpose(0, 3, 1, 2)  # nchw
-    image = torch.from_numpy(image)
-    return image  # 0 to 1
-
 
 def preprocess_image(image):
     w, h = image.size

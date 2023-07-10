@@ -8,6 +8,7 @@ import random
 import diffusers
 import torch
 from diffusers import (
+    AutoencoderKL,
     DDPMScheduler,
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
@@ -24,8 +25,6 @@ from diffusers import (
 
 from pipline_diffusers import (
     CLIP_MODEL_PATH,
-    V2_STABLE_DIFFUSION_PATH,
-    TOKENIZER_PATH,
     SCHEDULER_TIMESTEPS,
     SCHEDULER_LINEAR_START,
     SCHEDULER_LINEAR_END,
@@ -35,11 +34,10 @@ from pipline_diffusers import (
 )
 
 from pipline_diffusers import (
-    replace_unet_modules,
     PipelineLike,
 )
 
-from transformers import  CLIPTokenizer, CLIPModel
+from transformers import CLIPModel
 from PIL import Image
 
 class BatchDataBase(NamedTuple):
@@ -155,7 +153,7 @@ class TorchRandReplacer:
         raise AttributeError("'{}' object has no attribute '{}'".format(type(self).__name__, item))
 
 
-# img2imgの前処理、画像の読み込みなど
+# img2img的预处理
 def load_images(path):
     if os.path.isfile(path):
         paths = [path]
@@ -211,18 +209,13 @@ class GenImages():
         # path to checkpoint of vae to replace
         self._vae = None
 
-        # directory for caching Tokenizer (for offline training)
-        self.tokenizer_cache_dir = None
-
         # use xformers
         self.xformers = False
-        # use xformers by diffusers (Hypernetworks doesn't work) 
-        self.diffusers_xformers = False
         
         # set channels last option to model
         self.opt_channels_last = False
 
-        # Embeddings files of Textual Inversion / Textual Inversionのembeddings
+        # Embeddings files of Textual Inversion
         self.textual_inversion_embeddings = None
 
         # set another guidance scale for negative prompt
@@ -252,9 +245,8 @@ class GenImages():
         self._scheduler_num_noises_per_step = 0
         
         self._noise_manager = None
-        self._scheduler = None
         self._device = None
-        self._pipe = None
+        self._pipeline = None
 
         self.img_name_prefix = None # "network"
         self.img_name_type = "default"
@@ -276,55 +268,23 @@ class GenImages():
         use_stable_diffusion_format = os.path.isfile(self._ckpt)
         if use_stable_diffusion_format:
             print("load StableDiffusion checkpoint")
-            loading_pipe = StableDiffusionPipeline.from_ckpt(self._ckpt, safety_checker=None, torch_dtype=self._dtype)
-            self._text_encoder = loading_pipe.text_encoder
-            self._vae = loading_pipe.vae
-            self._unet = loading_pipe.unet
-            self._tokenizer = loading_pipe.tokenizer
-            del loading_pipe
+            loading_pipe = StableDiffusionPipeline.from_single_file(self._ckpt, safety_checker=None, torch_dtype=self._dtype)
         else:
             print("load Diffusers pretrained models")
             loading_pipe = StableDiffusionPipeline.from_pretrained(self._ckpt, safety_checker=None, torch_dtype=self._dtype)
-            self._text_encoder = loading_pipe.text_encoder
-            self._vae = loading_pipe.vae
-            self._unet = loading_pipe.unet
-            self._tokenizer = loading_pipe.tokenizer
-            del loading_pipe
+
+        self._text_encoder = loading_pipe.text_encoder
+        self._vae = loading_pipe.vae
+        self._unet = loading_pipe.unet
+        # tokenizer_cache 需要解决cache问题
+        self._tokenizer = loading_pipe.tokenizer
+        del loading_pipe
         
         if self.clip_guidance_scale  > 0 or self.clip_image_guidance_scale > 0:
             print("prepare clip model")
             self._clip_model = CLIPModel.from_pretrained(CLIP_MODEL_PATH, torch_dtype=self._dtype)
 
-    def _load_tokenizer(self):
-        print("loading tokenizer")
-        if not os.path.isfile(self._ckpt):
-            return
-        print("prepare tokenizer")
-        original_path = V2_STABLE_DIFFUSION_PATH if self.v2 else TOKENIZER_PATH
-
-        tokenizer: CLIPTokenizer = None
-        if self.tokenizer_cache_dir:
-            local_tokenizer_path = os.path.join(self.tokenizer_cache_dir, original_path.replace("/", "_"))
-            if os.path.exists(local_tokenizer_path):
-                print(f"load tokenizer from cache: {local_tokenizer_path}")
-                tokenizer = CLIPTokenizer.from_pretrained(local_tokenizer_path)  # same for v1 and v2
-
-        if tokenizer is None:
-            if self.v2:
-                tokenizer = CLIPTokenizer.from_pretrained(original_path, subfolder="tokenizer")
-            else:
-                tokenizer = CLIPTokenizer.from_pretrained(original_path)
-
-        if self.max_token_length > 0:
-            print(f"update token length: {self.max_token_length}")
-
-        if self.tokenizer_cache_dir and not os.path.exists(local_tokenizer_path):
-            print(f"save Tokenizer to cache: {local_tokenizer_path}")
-            tokenizer.save_pretrained(local_tokenizer_path)
-
-        self._tokenizer = tokenizer
-
-    def _get_scheduler(self, sampler="ddim"):
+    def set_scheduler(self, sampler="ddim"):
         sched_init_args = {}
         self._scheduler_num_noises_per_step = 1
 
@@ -414,7 +374,6 @@ class GenImages():
             sched_init_args["prediction_type"] = "v_prediction"
 
         self._noise_manager = NoiseManager()
-        
         scheduler_module.torch = TorchRandReplacer(self._noise_manager)
 
         scheduler = scheduler_cls(
@@ -428,18 +387,11 @@ class GenImages():
         if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is False:
             print("set clip_sample to True")
             scheduler.config.clip_sample = True
-        return scheduler
+        self._pipeline.set_scheduler(scheduler)
     
     def create_pipline(self):
-        # xformers、Hypernetwork 一致
-        if not self.diffusers_xformers:
-            replace_unet_modules(self._unet, not self.xformers, self.xformers)
-
-        # load tokenizer token分词器
-        self._load_tokenizer()
-
         # 确定 设备类型，使用GPU or CPU
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # "mps"を考量してない
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 不支持mps
 
         # custom pipeline
         self._vae.to(self._dtype).to(self._device)
@@ -448,7 +400,7 @@ class GenImages():
         if self._clip_model is not None:
             self._clip_model.to(self._dtype).to(self._device)
         
-        self._pipe = PipelineLike(
+        self._pipeline = PipelineLike(
             self._device,
             self._vae,
             self._text_encoder,
@@ -457,14 +409,11 @@ class GenImages():
             self._clip_model,
             self.clip_guidance_scale,
             self.clip_image_guidance_scale,
-            None,
-            0,
-            None
         )
         print("pipeline is ready.")
 
-        if self.diffusers_xformers:
-            self._pipe.enable_xformers_memory_efficient_attention()
+        if self.xformers:
+            self._pipeline.enable_xformers_memory_efficient_attention()
 
     def load_network(self, networks:tuple[NetWorkData], append_network=True):
         network_list = []
@@ -540,9 +489,9 @@ class GenImages():
             for network in self._networks:
                 network.to(memory_format=torch.channels_last)
 
-    def _set_embeddings(self):
+    def init_embeddings(self):
         if not self.textual_inversion_embeddings:
-            return 
+            return
         
         token_ids_embeds = []
         for embeds_file in self.textual_inversion_embeddings:
@@ -576,7 +525,7 @@ class GenImages():
             assert len(self._tokenizer) - 1 == token_ids[-1], f"token ids is not end of tokenize: {len(self._tokenizer)}"
 
             if num_vectors_per_token > 1:
-                self._pipe.add_token_replacement(token_ids[0], token_ids)
+                self._pipeline.add_token_replacement(token_ids[0], token_ids)
 
             token_ids_embeds.append((token_ids, embeds))
 
@@ -704,13 +653,16 @@ class GenImages():
         else:
             guide_images = None
 
-        # バッチ内の位置に関わらず同じ乱数を使うためにここで乱数を生成しておく。あわせてimage/maskがbatch内で同一かチェックする
+        # 在此相同的随机数，而不考虑该随机数在批量中的位置。同时检查batch中image/mask是否相同
         all_images_are_same = True
         all_masks_are_same = True
         all_guide_images_are_same = True
         for i, (_, (_, prompt, negative_prompt, seed, _, init_image, mask_image, clip_prompt, guide_image), _) in enumerate(batch):
             prompts.append(prompt)
-            negative_prompts.append(negative_prompt)
+            if not negative_prompt:
+                negative_prompts.append("")
+            else:
+                negative_prompts.append(negative_prompt)
             seeds.append(seed)
             clip_prompts.append(clip_prompt)
 
@@ -762,7 +714,7 @@ class GenImages():
                 if mask_images:
                     n.set_current_generation(batch_size, num_sub_prompts, width, height, shared)
 
-        images = self._pipe(
+        images = self._pipeline(
             prompts,
             negative_prompts,
             init_images,
@@ -798,6 +750,15 @@ class GenImages():
         return images_path
 
     def load_vae(self, vae):
+        # vae = AutoencoderKL.from_pretrained(vae, torch_dtype=torch.float16).to(self._device)
+        # Convert the VAE model.
+        # vae_config = create_vae_diffusers_config()
+        # converted_vae_checkpoint = convert_ldm_vae_checkpoint(checkpoint, vae_config)
+
+        # vae = AutoencoderKL(**vae_config)
+        # vae.load_state_dict(converted_vae_checkpoint)
+        # self._vae = vae
+
          # 单独加载vae
         # if vae is not None:
         #     self._vae = model_util.load_vae(vae, self._dtype)
@@ -811,16 +772,15 @@ class GenImages():
         if self.v2 and param.clip_skip > 1:
             print("v2 with clip_skip will be unexpected")
 
-        if param.networks:
-            # 需要完成后从模型上卸载network
-            self.load_network(param.networks, append_network=False)
+        # 需要完成后从模型上卸载network
+        self.load_network(param.networks, append_network=False)
 
         # 单独加载simple，当前是在pipline上创建的，需要修改pipline代码。
         # load scheduler 扩散调度器
-        self._pipe.set_scheduler(self._get_scheduler(param.sampler))
+        self.set_scheduler(param.sampler)
 
         # 单独加载embeddings
-        self._set_embeddings()
+        self.init_embeddings()
 
         # 初始化目录
         os.makedirs(self.outdir, exist_ok=True)
@@ -856,10 +816,3 @@ class GenImages():
         images_path = self._process_batch(batch_data)
         batch_data.clear()
         return images_path
-    
-    def gen_once_image(self):
-        self.create_pipline()
-
-        self.load_network()
-
-        self.gen_batch_process()
